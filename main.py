@@ -3,10 +3,14 @@ import sys
 import os
 import math
 import random
+import subprocess
 
 # Initialize Pygame
 pygame.init()
-pygame.mixer.init()
+try:
+    pygame.mixer.init()
+except pygame.error:
+    print("Audio non disponible - le jeu continuera sans son")
 
 # Screen settings
 SCREEN_WIDTH = 1400
@@ -632,23 +636,21 @@ class HomeScreen:
         if self.game_started:
             self.start_countdown -= 1
             if self.start_countdown <= 0:
-                print(f"Starting game for player: {self.player_name}")
-                self.show_toast = True
-                self.toast_message = "🎮 Chargement du jeu..."
-                self.toast_alpha = 255
-                self.toast_timer = 180
-                self.game_started = False
+                return "launch_game"
+        
+        return None
     
     def start_game(self):
         self.player_name = self.text_input.text
         self.show_toast = True
         self.toast_message = f"✨ Bienvenue {self.player_name} !"
         self.toast_alpha = 255
-        self.toast_timer = 180
+        self.toast_timer = 90
         self.game_started = True
-        self.start_countdown = 180
+        self.start_countdown = 90
 
 def main():
+    global screen
     clock = pygame.time.Clock()
     home_screen = HomeScreen()
     
@@ -661,11 +663,32 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
         
-        home_screen.update(events, mouse_pos)
+        result = home_screen.update(events, mouse_pos)
         home_screen.draw(screen)
         
         pygame.display.flip()
         clock.tick(60)
+        
+        # Launch 3D game
+        if result == "launch_game":
+            # Stop menu music
+            try:
+                pygame.mixer.music.stop()
+            except:
+                pass
+            
+            # Get player name
+            player_name = home_screen.player_name
+            
+            # Close Pygame completely
+            pygame.quit()
+            
+            # Launch 3D game
+            game_path = os.path.join(os.path.dirname(__file__), 'game3d_simple.py')
+            subprocess.run(['python', game_path, player_name])
+            
+            # Exit completely after 3D game closes
+            running = False
     
     pygame.quit()
     sys.exit()
