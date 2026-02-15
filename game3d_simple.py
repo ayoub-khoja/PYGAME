@@ -1,17 +1,224 @@
+"""
+=== JEU DE COURSE 3D - SUPER MARIO AVENTURE ETOILEE ===
+Ce fichier contient le jeu principal en 3D utilisant le moteur Ursina.
+Le joueur controle Mario sur une route sinueuse, collecte des pieces
+et evite les bombes pour atteindre la ligne d'arrivee.
+
+Modes de jeu :
+  - Solo  : Course seul avec score et pieces
+  - Multi : Course a 2 joueurs en reseau local (LAN)
+
+Fichiers lies :
+  - menu_principal.py       : Menu de lancement du jeu
+  - serveur_multijoueur.py  : Serveur pour le mode 2 joueurs
+"""
+
 from ursina import *
 import random
 import sys
 import math
+import socket
+import threading
+import json
 
-# Get player name from command line
+# ============== ARGUMENTS DE LIGNE DE COMMANDE ==============
+# Solo  : python jeu_course_3d.py [nom]
+# Multi : python jeu_course_3d.py [nom] --multi [ip_serveur] [code_salle]
 player_name = "Joueur"
+multiplayer = False
+server_ip = "127.0.0.1"
+room_code = "AYOUB-YASSMINE"
+MULTI_PORT = 5556
+
 if len(sys.argv) > 1:
     player_name = sys.argv[1]
+if "--multi" in sys.argv:
+    multiplayer = True
+    idx = sys.argv.index("--multi")
+    if idx + 1 < len(sys.argv):
+        server_ip = sys.argv[idx + 1]
+    if idx + 2 < len(sys.argv):
+        room_code = sys.argv[idx + 2]
 
-# Initialize Ursina
+# ============== RESEAU (mode multijoueur uniquement) ==============
+net_sock = None
+net_buffer = ""
+net_player_id = None
+net_other_player = {}      # {x, y, z, ry, coins, score, name, finished, dead}
+net_collected_coins = []   # indices of coins collected by either player
+net_winner = None
+net_game_started = False
+net_countdown = -1          # -1 = pas de countdown, 5/4/3/2/1 = en cours, 0 = GO
+net_race_started = False    # True quand le GO est donné (les joueurs peuvent bouger)
+net_lock = threading.Lock()
+
+def net_connect():
+    """Connexion au serveur multijoueur avec logique de tentatives."""
+    global net_sock, net_player_id
+    import time as _time
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1:
+                print(f"[NET] Tentative {attempt}/{max_retries}...")
+                _time.sleep(3)
+
+            net_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            net_sock.settimeout(15.0)
+            net_sock.connect((server_ip, MULTI_PORT))
+            print(f"[NET] Connecte a {server_ip}:{MULTI_PORT}")
+
+            # Envoyer code + nom
+            join_data = json.dumps({"type": "join", "code": room_code}) + "\n"
+            join_data += json.dumps({"type": "set_name", "name": player_name}) + "\n"
+            net_sock.sendall(join_data.encode("utf-8"))
+            print(f"[NET] Donnees envoyees, attente reponse du serveur...")
+
+            # Attendre la réponse (welcome ou error)
+            net_sock.settimeout(20.0)
+            resp = b""
+            deadline = _time.time() + 20
+            while _time.time() < deadline:
+                try:
+                    chunk = net_sock.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                    if b"\n" in resp:
+                        break
+                except socket.timeout:
+                    break
+
+            if not resp:
+                print(f"[NET] Pas de reponse du serveur (tentative {attempt})")
+                net_sock.close()
+                net_sock = None
+                continue
+
+            resp_str = resp.decode("utf-8")
+            for line in resp_str.strip().split("\n"):
+                if line.strip():
+                    msg = json.loads(line)
+                    if msg.get("type") == "error":
+                        print(f"[NET] REFUSE: {msg.get('message')}")
+                        net_sock.close()
+                        net_sock = None
+                        return False
+                    if msg.get("type") == "welcome":
+                        net_player_id = msg.get("player_id")
+                        print(f"[NET] Accepte ! Tu es Joueur {net_player_id}")
+
+            if net_player_id is not None:
+                net_sock.settimeout(None)
+                net_sock.setblocking(False)
+                return True
+            else:
+                print(f"[NET] Reponse invalide du serveur (tentative {attempt})")
+                net_sock.close()
+                net_sock = None
+                continue
+
+        except Exception as e:
+            print(f"[NET] Erreur tentative {attempt}: {e}")
+            if net_sock:
+                try:
+                    net_sock.close()
+                except:
+                    pass
+                net_sock = None
+
+    print(f"[NET] Echec apres {max_retries} tentatives.")
+    return False
+
+def net_receive():
+    """Recevoir les donnees du serveur (non-bloquant, appele chaque frame)."""
+    global net_buffer, net_other_player, net_collected_coins, net_winner, net_game_started
+    global net_countdown, net_race_started
+    if not net_sock:
+        return
+    try:
+        data = net_sock.recv(8192)
+        if not data:
+            return
+        net_buffer += data.decode("utf-8")
+        while "\n" in net_buffer:
+            line, net_buffer = net_buffer.split("\n", 1)
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            if msg.get("type") == "state":
+                with net_lock:
+                    players = msg.get("players", {})
+                    other_id = "2" if net_player_id == 1 else "1"
+                    if other_id in players:
+                        net_other_player = players[other_id]
+                    elif int(other_id) in players:
+                        net_other_player = players[int(other_id)]
+                    net_collected_coins = msg.get("collected_coins", [])
+                    net_winner = msg.get("winner")
+            elif msg.get("type") == "countdown":
+                net_countdown = msg.get("seconds", 0)
+                if net_countdown == 0:
+                    print("[NET] GO !")
+            elif msg.get("type") == "start":
+                net_game_started = True
+                net_race_started = True
+                print("[NET] La course commence !")
+    except BlockingIOError:
+        pass
+    except Exception:
+        pass
+
+def net_send_position(x, y, z, ry, coins_count, score_val):
+    """Envoyer la position du joueur local au serveur."""
+    if not net_sock:
+        return
+    try:
+        msg = json.dumps({"type": "position", "x": round(x, 2), "y": round(y, 2), "z": round(z, 2), "ry": round(ry, 1), "coins": coins_count, "score": score_val}) + "\n"
+        net_sock.sendall(msg.encode("utf-8"))
+    except:
+        pass
+
+def net_send_collect_coin(index):
+    """Informer le serveur qu'on a collecte une piece."""
+    if not net_sock:
+        return
+    try:
+        net_sock.sendall((json.dumps({"type": "collect_coin", "index": index}) + "\n").encode("utf-8"))
+    except:
+        pass
+
+def net_send_finished():
+    """Informer le serveur qu'on a franchi la ligne d'arrivee."""
+    if not net_sock:
+        return
+    try:
+        net_sock.sendall((json.dumps({"type": "finished"}) + "\n").encode("utf-8"))
+    except:
+        pass
+
+def net_send_dead():
+    """Informer le serveur qu'on a touche une bombe."""
+    if not net_sock:
+        return
+    try:
+        net_sock.sendall((json.dumps({"type": "dead"}) + "\n").encode("utf-8"))
+    except:
+        pass
+
+# Connexion si mode multijoueur
+if multiplayer:
+    print(f"[NET] Mode multijoueur - Connexion a {server_ip}...")
+    if not net_connect():
+        print("[NET] Impossible de se connecter. Lancement en mode solo.")
+        multiplayer = False
+    else:
+        print("[NET] En attente du 2eme joueur (dans le jeu)...")
+
+# Initialisation du moteur Ursina
 app = Ursina(title=f'Super Mario - {player_name}', borderless=False)
 
-# Window settings
+# Parametres de la fenetre
 window.fullscreen = False
 window.size = (1400, 800)
 window.fps_counter.enabled = False
@@ -19,22 +226,22 @@ window.entity_counter.enabled = False
 window.collider_counter.enabled = False
 window.exit_button.visible = False
 
-# Game variables
+# Variables du jeu
 score = 0
 coins_collected = 0
 game_won = False
 game_over = False
 mario_local_x = 0  # offset latéral du joueur par rapport au centre de la route
 
-# Colors
+# Couleurs
 GREEN = color.rgb(34, 197, 94)
 BROWN = color.rgb(139, 69, 19)
 GRAY = color.rgb(180, 180, 180)
 GOLD = color.rgb(255, 215, 0)
 DARK_BROWN = color.rgb(100, 50, 10)
 
-# ============== CURVED ROAD SYSTEM ==============
-# Route longue avec de grands virages (la route va à droite et avance)
+# ============== SYSTEME DE ROUTE SINUEUSE ==============
+# Route longue avec de grands virages (la route va a droite et avance)
 def road_center_x(z):
     # Grand virage progressif vers la droite + ondulations
     return math.sin(z * 0.004) * 25 + math.sin(z * 0.012) * 12 + math.cos(z * 0.007) * 8
@@ -50,7 +257,7 @@ def road_perpendicular(z):
     angle_rad = math.radians(road_angle_at(z))
     return math.cos(angle_rad), -math.sin(angle_rad)
 
-# ============== CREATE GROUND ==============
+# ============== CREATION DU SOL ==============
 ground = Entity(
     model='plane',
     scale=(500, 1, 2000),
@@ -59,7 +266,7 @@ ground = Entity(
     collider='box'
 )
 
-# ============== CREATE CURVED ROAD SEGMENTS ==============
+# ============== CREATION DES SEGMENTS DE ROUTE ==============
 road_start_z = 360
 road_end_z = -600
 segment_length = 4
@@ -103,7 +310,7 @@ for z in range(road_end_z, road_start_z, segment_length):
         color=GRAY,
     )
 
-# ============== LOAD MARIO ==============
+# ============== CHARGEMENT DU MODELE MARIO ==============
 mario_start_z = 350
 try:
     mario = Entity(
@@ -120,7 +327,48 @@ except:
         color=color.red
     )
 
-# ============== CREATE COINS ON THE CURVED PATH ==============
+# ============== 2EME MARIO (MULTIJOUEUR) ==============
+mario2 = None
+mario2_name_text = None
+if multiplayer:
+    try:
+        mario2 = Entity(
+            model='assets/mario.glb',
+            scale=3,
+            position=(road_center_x(mario_start_z), 1, mario_start_z - 5),
+            rotation=(0, 180, 0),
+            color=color.rgb(100, 200, 100),  # Teinte verte pour le distinguer
+        )
+    except:
+        mario2 = Entity(
+            model='cube',
+            scale=(1, 2, 1),
+            position=(road_center_x(mario_start_z), 1, mario_start_z - 5),
+            color=color.green,
+        )
+    # Nom du 2ème joueur au-dessus de sa tête
+    mario2_name_text = Text(
+        text='Joueur 2',
+        position=(0, 0),
+        scale=1.5,
+        color=color.rgb(100, 255, 100),
+        origin=(0, 0),
+        billboard=True,
+    )
+
+# Nom local au-dessus de notre Mario
+local_name_text = None
+if multiplayer:
+    local_name_text = Text(
+        text=player_name,
+        position=(0, 0),
+        scale=1.5,
+        color=color.rgb(255, 200, 100),
+        origin=(0, 0),
+        billboard=True,
+    )
+
+# ============== CREATION DES PIECES SUR LA ROUTE ==============
 coins = []
 num_coins = 70
 try:
@@ -145,7 +393,7 @@ except:
         )
         coins.append(coin)
 
-# ============== BUILDINGS ALONG CURVED ROAD ==============
+# ============== BATIMENTS LE LONG DE LA ROUTE ==============
 building_textures = [
     'assets/PNG/buildingTiles_036.png',
     'assets/PNG/buildingTiles_044.png',
@@ -181,7 +429,7 @@ for i in range(55):
         unlit=True,
     )
 
-# ============== CARS ALONG CURVED ROAD ==============
+# ============== VOITURES LE LONG DE LA ROUTE ==============
 car_textures = [
     'assets/PNG/Cars/taxi.png',
     'assets/PNG/Cars/police.png',
@@ -214,7 +462,7 @@ for i in range(30):
         unlit=True,
     )
 
-# ============== BOMBS ON THE ROAD ==============
+# ============== BOMBES SUR LA ROUTE ==============
 bombs = []
 RED = color.rgb(200, 30, 30)
 DARK_RED = color.rgb(120, 10, 10)
@@ -239,7 +487,7 @@ for i in range(12):
     )
     bombs.append(bomb)
 
-# ============== MIDPOINT MARKER (transition jour → soir) ==============
+# ============== PORTAIL DU MILIEU (transition jour vers soir) ==============
 mid_z = (road_start_z + road_end_z) // 2  # milieu de la route
 mid_cx = road_center_x(mid_z)
 mid_angle = road_angle_at(mid_z)
@@ -288,7 +536,7 @@ for j in range(5):
         unlit=True,
     )
 
-# ============== FINISH LINE (professionnelle) ==============
+# ============== LIGNE D'ARRIVEE ==============
 finish_z = -580
 finish_cx = road_center_x(finish_z)
 finish_angle = road_angle_at(finish_z)
@@ -377,7 +625,7 @@ for side in [-1, 1]:
         unlit=True,
     )
 
-# ============== UI PANEL ==============
+# ============== PANNEAU D'INTERFACE (HUD) ==============
 hud_bg = Entity(
     parent=camera.ui,
     model='quad',
@@ -448,6 +696,68 @@ controls_text = Text(
     color=color.rgba(200, 200, 200, 180),
 )
 
+# ============== HUD DU JOUEUR 2 (multijoueur) ==============
+p2_hud_bg = None
+p2_name_hud = None
+p2_score_hud = None
+p2_coins_hud = None
+p2_status_hud = None
+
+if multiplayer:
+    # Panneau en haut à droite pour le Joueur 2
+    p2_hud_bg = Entity(parent=camera.ui, model='quad', color=color.rgba(0, 0, 0, 150), scale=(0.38, 0.14), position=(0.67, 0.41))
+    Entity(parent=camera.ui, model='quad', color=color.rgb(100, 255, 100), scale=(0.38, 0.008), position=(0.67, 0.475))
+    p2_name_hud = Text(text='Joueur 2', position=(0.50, 0.46), scale=1.3, color=color.rgb(100, 255, 100))
+    Entity(parent=camera.ui, model='quad', color=color.rgba(100, 255, 100, 80), scale=(0.34, 0.002), position=(0.67, 0.435))
+    p2_score_hud = Text(text='Score:   0', position=(0.50, 0.42), scale=1.3, color=color.rgb(100, 255, 100), font='VeraMono.ttf')
+    p2_coins_hud = Text(text='Pieces:  0/70', position=(0.50, 0.39), scale=1.1, color=color.rgb(180, 255, 180))
+    p2_status_hud = Text(text='En course...', position=(0.50, 0.36), scale=1.0, color=color.rgb(200, 200, 200))
+    Entity(parent=camera.ui, model='quad', color=color.rgb(100, 255, 100), scale=(0.38, 0.004), position=(0.67, 0.335))
+
+    # Mode multijoueur affiché
+    Text(text='MODE 2 JOUEURS', position=(0, 0.48), origin=(0, 0), scale=1.2, color=color.rgb(255, 215, 0))
+
+# ============== AFFICHAGE DU COMPTE A REBOURS (multijoueur) ==============
+countdown_overlay = Entity(parent=camera.ui, model='quad', color=color.rgba(0, 0, 0, 150), scale=(3, 2), z=-20, enabled=False)
+countdown_number = Text(
+    text='5',
+    position=(0, 0.05),
+    origin=(0, 0),
+    scale=8,
+    color=color.rgb(255, 215, 0),
+    enabled=False,
+    font='VeraMono.ttf',
+    z=-21,
+)
+countdown_label = Text(
+    text='PREPAREZ-VOUS !',
+    position=(0, 0.28),
+    origin=(0, 0),
+    scale=2.5,
+    color=color.white,
+    enabled=False,
+    z=-21,
+)
+countdown_players_info = Text(
+    text='',
+    position=(0, -0.18),
+    origin=(0, 0),
+    scale=1.5,
+    color=color.rgb(200, 200, 200),
+    enabled=False,
+    z=-21,
+)
+waiting_text = None
+if multiplayer:
+    waiting_text = Text(
+        text='En attente du 2eme joueur...',
+        position=(0, 0),
+        origin=(0, 0),
+        scale=2.5,
+        color=color.rgb(255, 215, 0),
+        z=-21,
+    )
+
 # ============== POPUP DE VICTOIRE (désactivée au début) ==============
 # Overlay sombre plein écran (z le plus loin)
 win_overlay = Entity(parent=camera.ui, model='quad', color=color.rgba(0, 0, 0, 200), scale=(3, 2), z=-10, enabled=False)
@@ -505,7 +815,7 @@ game_over_text = Text(
     origin=(0, 0),
 )
 
-# ============== CAMERA & SCENE ==============
+# ============== CAMERA ET SCENE ==============
 camera.fov = 80
 sky = Sky()
 sun_light = DirectionalLight()
@@ -520,82 +830,180 @@ day_ground = GREEN
 sunset_ground = color.rgb(30, 80, 30)       # Vert sombre
 theme_changed = False
 
-# Speed
+# Vitesse
 move_speed = 8
 forward_speed = 15
 mario_z = mario_start_z  # track Mario's z position along the path
 
+net_frame_counter = 0
+
 def update():
-    global score, coins_collected, game_won, game_over, mario_local_x, mario_z
+    global score, coins_collected, game_won, game_over, mario_local_x, mario_z, net_frame_counter
+    global net_winner
+
+    # ============== RESEAU : reception des donnees ==============
+    if multiplayer:
+        net_receive()
+
+        # ============== PHASE D'ATTENTE / COUNTDOWN ==============
+        if not net_race_started:
+            if net_countdown < 0:
+                # En attente du 2ème joueur - fenêtre ouverte, jeu gelé
+                if waiting_text:
+                    waiting_text.enabled = True
+                countdown_overlay.enabled = False
+                countdown_number.enabled = False
+                countdown_label.enabled = False
+                countdown_players_info.enabled = False
+                update_camera()
+                return  # BLOQUER tout mouvement
+
+            elif net_countdown > 0:
+                # Countdown en cours (5, 4, 3, 2, 1)
+                if waiting_text:
+                    waiting_text.enabled = False
+                countdown_overlay.enabled = True
+                countdown_number.enabled = True
+                countdown_label.enabled = True
+                countdown_players_info.enabled = True
+                countdown_number.text = str(net_countdown)
+                countdown_number.scale = 8
+                # Couleur dynamique
+                if net_countdown >= 4:
+                    countdown_number.color = color.rgb(255, 80, 80)
+                elif net_countdown >= 2:
+                    countdown_number.color = color.rgb(255, 200, 50)
+                else:
+                    countdown_number.color = color.rgb(100, 255, 100)
+                other_name = net_other_player.get("name", "...") if net_other_player else "..."
+                countdown_players_info.text = f'{player_name} (toi)  VS  {other_name}'
+                update_camera()
+                return  # BLOQUER tout mouvement
+
+            else:
+                # net_countdown == 0 → GO!
+                if waiting_text:
+                    waiting_text.enabled = False
+                countdown_overlay.enabled = True
+                countdown_number.enabled = True
+                countdown_label.enabled = False
+                countdown_players_info.enabled = False
+                countdown_number.text = 'GO!'
+                countdown_number.color = color.rgb(100, 255, 100)
+                countdown_number.scale = 10
+                update_camera()
+                return  # Attendre le message "start" du serveur
+
+        else:
+            # Course lancée → cacher tout le UI d'attente
+            if waiting_text:
+                waiting_text.enabled = False
+            countdown_overlay.enabled = False
+            countdown_number.enabled = False
+            countdown_label.enabled = False
+            countdown_players_info.enabled = False
+
+        # Synchroniser les coins collectés par l'autre joueur
+        with net_lock:
+            for idx in net_collected_coins:
+                if 0 <= idx < len(coins) and coins[idx].enabled:
+                    coins[idx].enabled = False
+
+            # Mettre à jour le 2ème Mario
+            if mario2 and net_other_player:
+                mario2.x = net_other_player.get("x", mario2.x)
+                mario2.y = net_other_player.get("y", mario2.y)
+                mario2.z = net_other_player.get("z", mario2.z)
+                mario2.rotation_y = net_other_player.get("ry", 180)
+
+                # Nom au-dessus du 2ème Mario
+                if mario2_name_text:
+                    other_name = net_other_player.get("name", "Joueur 2")
+                    mario2_name_text.text = other_name
+                    mario2_name_text.world_position = Vec3(mario2.x, mario2.y + 5, mario2.z)
+
+                # HUD du joueur 2
+                if p2_name_hud:
+                    p2_name_hud.text = net_other_player.get("name", "Joueur 2")
+                if p2_score_hud:
+                    p2_score_hud.text = f'Score:   {net_other_player.get("score", 0)}'
+                if p2_coins_hud:
+                    p2_coins_hud.text = f'Pieces:  {net_other_player.get("coins", 0)}/70'
+                if p2_status_hud:
+                    if net_other_player.get("finished"):
+                        p2_status_hud.text = 'ARRIVE !'
+                        p2_status_hud.color = color.rgb(255, 215, 0)
+                    elif net_other_player.get("dead"):
+                        p2_status_hud.text = 'ELIMINE'
+                        p2_status_hud.color = color.red
+                    else:
+                        p2_status_hud.text = 'En course...'
+
+            # Vérifier si l'autre joueur a gagné
+            if net_winner is not None and not game_won and not game_over:
+                if net_winner != net_player_id:
+                    pass  # On continue à jouer
+
+        # Nom local au-dessus de notre Mario
+        if local_name_text:
+            local_name_text.world_position = Vec3(mario.x, mario.y + 5, mario.z)
+
     if game_won or game_over:
         return
-    
-    # Rotate coins
+
+    # Rotation des pieces
     for coin in coins:
         if coin.enabled:
             coin.rotation_y += 100 * time.dt
-    
-    # Rotate/pulse bombs for visibility
+
+    # Rotation des bombes pour visibilite
     for bomb in bombs:
         if bomb.enabled:
             bomb.rotation_y += 80 * time.dt
-    
-    # Move Mario forward along path
+
+    # Avancer Mario le long de la route
     mario_z -= forward_speed * time.dt
-    
-    # Lateral movement (left/right relative to road)
+
+    # Mouvement lateral (gauche/droite par rapport a la route)
     if held_keys['left arrow'] or held_keys['a']:
         mario_local_x -= move_speed * time.dt
     if held_keys['right arrow'] or held_keys['d']:
         mario_local_x += move_speed * time.dt
-    
+
     mario_local_x = clamp(mario_local_x, -4, 4)
-    
-    # Calculate road center and direction at Mario's position
+
+    # Calculer le centre et la direction de la route a la position de Mario
     rcx = road_center_x(mario_z)
     angle = road_angle_at(mario_z)
     angle_rad = math.radians(angle)
-    
-    # Perpendicular direction for lateral offset
+
+    # Direction perpendiculaire pour le decalage lateral
     perp_x = math.cos(angle_rad)
     perp_z = -math.sin(angle_rad)
-    
-    # Position Mario on the curved road
+
+    # Positionner Mario sur la route sinueuse
     mario.x = rcx + mario_local_x * perp_x
     mario.z = mario_z + mario_local_x * perp_z
     mario.y = 1
-    
-    # Rotate Mario to face the road direction
+
+    # Tourner Mario dans la direction de la route
     mario.rotation_y = 180 + angle
-    
+
     # ============== CAMERA toujours derrière Mario ==============
-    cam_behind_dist = 35
-    cam_height = 22
-    
-    # La caméra suit Mario simplement : même X que Mario, derrière en Z
-    target_cam_x = mario.x
-    target_cam_z = mario.z + cam_behind_dist
-    target_cam_y = mario.y + cam_height
-    
-    # Lerp fluide pour un mouvement doux
-    smooth = 5 * time.dt
-    camera.x += (target_cam_x - camera.x) * smooth
-    camera.y += (target_cam_y - camera.y) * smooth
-    camera.z += (target_cam_z - camera.z) * smooth
-    
-    # La caméra regarde toujours Mario
-    camera.look_at(Vec3(mario.x, mario.y + 3, mario.z))
-    
-    # ============== COIN COLLECTION ==============
-    for coin in coins:
+    update_camera()
+
+    # ============== COLLECTE DES PIECES ==============
+    for i, coin in enumerate(coins):
         if coin.enabled and distance(mario.position, coin.position) < 3:
             coin.enabled = False
             score += 100
             coins_collected += 1
             score_text.text = f'Score:   {score}'
             coins_text.text = f'Pieces:  {coins_collected}/70'
-    
-    # ============== BOMB COLLISION (GAME OVER) ==============
+            if multiplayer:
+                net_send_collect_coin(i)
+
+    # ============== COLLISION AVEC BOMBE (FIN DE PARTIE) ==============
     for bomb in bombs:
         if bomb.enabled and distance(mario.position, bomb.position) < 2.5:
             bomb.enabled = False
@@ -603,49 +1011,82 @@ def update():
             game_over_text.enabled = True
             game_over_text.text = f'GAME OVER!\n\nBombe touchee!\nScore: {score}\n\nESC pour retour au menu'
             mario.visible = False
+            if multiplayer:
+                net_send_dead()
             return
-    
-    # ============== PROGRESS ==============
+
+    # ============== PROGRESSION ==============
     progress = clamp(int((mario_start_z - mario_z) / (mario_start_z - finish_z) * 100), 0, 100)
-    
-    # ============== TRANSITION JOUR → MODE SOMBRE (après 50%) ==============
-    # Style Chrome Dino dark mode : fond noir, sol sombre, ambiance nuit
+
+    # ============== TRANSITION JOUR VERS NUIT (apres 50%) ==============
     if progress >= 50:
         t = clamp((progress - 50) / 50, 0, 1)
-        
-        # Ciel → noir total
+
         sky.color = color.rgb(
             int(135 * (1 - t)),
             int(206 * (1 - t)),
             int(235 * (1 - t)),
         )
-        
-        # Sol → noir/gris très sombre (style Chrome Dino)
+
         ground.color = color.rgb(
             int(50 * (1 - t) + 15 * t),
             int(150 * (1 - t) + 15 * t),
             int(50 * (1 - t) + 15 * t),
         )
-        
-        # Lumière → très faible, gris sombre
+
         sun_light.color = color.rgb(
             int(255 * (1 - t) + 40 * t),
             int(255 * (1 - t) + 40 * t),
             int(255 * (1 - t) + 45 * t),
         )
-        
-        # Fog noir pour renforcer l'ambiance sombre
+
         scene.fog_density = t * 0.01
         scene.fog_color = color.rgb(0, 0, 0)
-    
-    # ============== WIN ==============
+
+    # ============== RESEAU : envoi de la position ==============
+    if multiplayer:
+        net_frame_counter += 1
+        if net_frame_counter % 2 == 0:  # Envoyer toutes les 2 frames
+            net_send_position(mario.x, mario.y, mario.z, mario.rotation_y, coins_collected, score)
+
+    # ============== VICTOIRE ==============
     if mario_z <= finish_z + 5:
         game_won = True
+        if multiplayer:
+            net_send_finished()
+            # Vérifier qui a gagné
+            with net_lock:
+                if net_winner is not None and net_winner != net_player_id:
+                    # L'autre a gagné avant nous
+                    win_trophy.text = '2EME'
+                    win_congrats.text = f'{player_name}, tu es arrive 2eme !'
+                else:
+                    win_trophy.text = '1ER !'
+                    win_congrats.text = f'Bravo {player_name}, tu es 1er !'
+        else:
+            win_congrats.text = f'Felicitations {player_name} !'
+
         for elem in win_elements:
             elem.enabled = True
-        win_congrats.text = f'Felicitations {player_name} !'
         win_score_label.text = f'{score}'
         win_coins_label.text = f'Pieces collectees: {coins_collected} / 70'
+
+
+def update_camera():
+    """Met a jour la camera pour suivre Mario - appele chaque frame."""
+    cam_behind_dist = 35
+    cam_height = 22
+
+    target_cam_x = mario.x
+    target_cam_z = mario.z + cam_behind_dist
+    target_cam_y = mario.y + cam_height
+
+    smooth = 5 * time.dt
+    camera.x += (target_cam_x - camera.x) * smooth
+    camera.y += (target_cam_y - camera.y) * smooth
+    camera.z += (target_cam_z - camera.z) * smooth
+
+    camera.look_at(Vec3(mario.x, mario.y + 3, mario.z))
 
 def input(key):
     if key == 'escape':
